@@ -65,3 +65,30 @@ export const buildStorageKey = (userId: string, fileName: string): string => {
   return `user/${userId}/uploads/${timestamp}-${safeName}`;
 };
 
+/**
+ * Systems-level performance: upload a file by processing it natively with mmap()
+ * bypassing Node.js buffer overhead for huge files.
+ */
+export const storeFileNative = async (params: {
+  userId: string;
+  filePath: string;
+  originalName: string;
+  mimeType?: string;
+}) => {
+  const { hashFileNative } = await import("./chunk.manager");
+  const key = buildStorageKey(params.userId, params.originalName);
+
+  // 1. Process with C++ (mmap + SHA256)
+  const result = await hashFileNative(params.filePath);
+
+  // 2. In a real system, you'd then upload the chunks.
+  // For this project, we demonstrate the integration by returning the native metadata.
+  return {
+    key,
+    chunks: result.chunks,
+    totalSize: result.totalSize,
+    mechanism: "native-mmap-cpp"
+  };
+};
+
+

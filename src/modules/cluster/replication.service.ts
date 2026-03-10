@@ -3,6 +3,7 @@ import { decideWritePlacement, scheduleReplication } from "./consistency.manager
 import { getAllNodes } from "./node.manager";
 import { logger } from "../../config/logger";
 import { config } from "../../config/env";
+import { nativeReplicate } from "../storage/native.wrapper";
 
 // Replication service glues together placement decisions with concrete HTTP calls
 // to peer nodes. For this project we keep it very small and readable.
@@ -29,37 +30,57 @@ export const planReplication = (ctx: ReplicationContext): ReplicationDecision =>
   };
 };
 
-// Best-effort asynchronous replication via HTTP. This assumes peer nodes expose
-// a simple replication endpoint (not yet implemented) that can copy objects between stores.
+/**
+ * Multithreaded Replication Engine call.
+ * Rewritten in C++ for performance and reliable retries with exponential backoff.
+ */
 export const triggerReplication = async (ctx: ReplicationDecision): Promise<void> => {
   if (!config.cluster.enabled || ctx.replicaNodeIds.length === 0) return;
 
   scheduleReplication(ctx.storageKey, ctx.replicaNodeIds);
 
   const nodes = getAllNodes();
-  const targets = nodes.filter((n) => ctx.replicaNodeIds.includes(n.id) && n.baseUrl);
+  const targetUrls = nodes
+    .filter((n) => ctx.replicaNodeIds.includes(n.id) && n.baseUrl)
+    .map(n => n.baseUrl);
 
-  await Promise.all(
-    targets.map(async (node) => {
-      try {
-        const res = await fetch(`${node.baseUrl}/internal/replicate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            storageKey: ctx.storageKey,
-            mimeType: ctx.mimeType,
-            sizeBytes: ctx.sizeBytes
-          }),
-          timeout: 3000 as any
-        });
+  try {
+    logger.info("Triggering C++ Multithreaded Replication Engine", {
+      storageKey: ctx.storageKey,
+      targets: targetUrls.length
+    });
 
-        if (!res.ok) {
-          logger.warn("Replication call failed", { nodeId: node.id, status: res.status });
+    // Call the C++ Engine (handles thread pool, work queue, and retries internally)
+    nativeReplicate(ctx.storageKey, targetUrls);
+
+  } catch (err) {
+    logger.warn("Native replication failed, falling back to JS implementation", { error: (err as any).message });
+
+    // Fallback to legacy JS implementation if native fails
+    const targets = nodes.filter((n) => ctx.replicaNodeIds.includes(n.id) && n.baseUrl);
+    await Promise.all(
+      targets.map(async (node) => {
+        try {
+          const res = await fetch(`${node.baseUrl}/internal/replicate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              storageKey: ctx.storageKey,
+              mimeType: ctx.mimeType,
+              sizeBytes: ctx.sizeBytes
+            }),
+            timeout: 3000 as any
+          });
+
+          if (!res.ok) {
+            logger.warn("JS Replication fallback failed", { nodeId: node.id, status: res.status });
+          }
+        } catch (err) {
+          logger.warn("Error in JS replication fallback", { nodeId: node.id });
         }
-      } catch (err) {
-        logger.warn("Error while calling replication endpoint", { nodeId: node.id });
-      }
-    })
-  );
+      })
+    );
+  }
 };
+
 
